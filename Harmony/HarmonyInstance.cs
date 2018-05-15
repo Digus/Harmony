@@ -1,9 +1,11 @@
-﻿using System;
+using Harmony.Tools;
+using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
+using System.Reflection.Emit;
 
 namespace Harmony
 {
@@ -46,6 +48,7 @@ namespace Harmony
 		HarmonyInstance(string id)
 		{
 			this.id = id;
+			SelfPatching.PatchOldHarmonyMethods();
 		}
 
 		public static HarmonyInstance Create(string id)
@@ -55,6 +58,13 @@ namespace Harmony
 		}
 
 		//
+
+		public void PatchAll()
+		{
+			var method = new StackTrace().GetFrame(1).GetMethod();
+			var assembly = method.ReflectedType.Assembly;
+			PatchAll(assembly);
+		}
 
 		public void PatchAll(Assembly assembly)
 		{
@@ -70,17 +80,29 @@ namespace Harmony
 			});
 		}
 
-		public void Patch(MethodBase original, HarmonyMethod prefix, HarmonyMethod postfix, HarmonyMethod transpiler = null)
+		public DynamicMethod Patch(MethodBase original, HarmonyMethod prefix, HarmonyMethod postfix, HarmonyMethod transpiler = null)
 		{
-			var processor = new PatchProcessor(this, original, prefix, postfix, transpiler);
-			processor.Patch();
+			var processor = new PatchProcessor(this, new List<MethodBase> { original }, prefix, postfix, transpiler);
+			return processor.Patch().FirstOrDefault();
+		}
+
+		public void RemovePatch(MethodBase original, HarmonyPatchType type, string harmonyID = null)
+		{
+			var processor = new PatchProcessor(this, new List<MethodBase> { original });
+			processor.Unpatch(type, harmonyID);
+		}
+
+		public void RemovePatch(MethodBase original, MethodInfo patch)
+		{
+			var processor = new PatchProcessor(this, new List<MethodBase> { original });
+			processor.Unpatch(patch);
 		}
 
 		//
 
-		public Patches IsPatched(MethodBase method)
+		public Patches GetPatchInfo(MethodBase method)
 		{
-			return PatchProcessor.IsPatched(method);
+			return PatchProcessor.GetPatchInfo(method);
 		}
 
 		public IEnumerable<MethodBase> GetPatchedMethods()

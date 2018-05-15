@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
 using System.Reflection.Emit;
@@ -12,11 +13,10 @@ namespace Harmony.ILCopying
 		readonly MethodBodyReader reader;
 		readonly List<MethodInfo> transpilers = new List<MethodInfo>();
 
-		public MethodCopier(MethodBase fromMethod, DynamicMethod toDynamicMethod, LocalBuilder[] existingVariables = null)
+		public MethodCopier(MethodBase fromMethod, ILGenerator toILGenerator, LocalBuilder[] existingVariables = null)
 		{
-			if (fromMethod == null) throw new Exception("method cannot be null");
-			var generator = toDynamicMethod.GetILGenerator();
-			reader = new MethodBodyReader(fromMethod, generator);
+			if (fromMethod == null) throw new ArgumentNullException("Method cannot be null");
+			reader = new MethodBodyReader(fromMethod, toILGenerator);
 			reader.DeclareVariables(existingVariables);
 			reader.ReadInstructions();
 		}
@@ -26,9 +26,9 @@ namespace Harmony.ILCopying
 			transpilers.Add(transpiler);
 		}
 
-		public void Emit(Label endLabel)
+		public void Finalize(List<Label> endLabels, List<ExceptionBlock> endBlocks)
 		{
-			reader.FinalizeILCodes(transpilers, endLabel);
+			reader.FinalizeILCodes(transpilers, endLabels, endBlocks);
 		}
 	}
 
@@ -49,16 +49,27 @@ namespace Harmony.ILCopying
 
 		LocalBuilder[] variables;
 
-		public static List<ILInstruction> GetInstructions(MethodBase method)
+		// NOTE: you cannot simply "copy" ILInstructions from a method. They contain references to
+		// local variables which must be CREATED on an ILGenerator or else they are invalid when you
+		// want to use the ILInstruction. If you are really clever, you can supply a dummy generator
+		// and edit out all labels during the processing but that might be more tricky than you think.
+		//
+		// In order to copy together a bunch of method parts within a transpiler, you either have to
+		// accep that by passing the generator that will build your new method, you will end up with
+		// the sum of all declared local variables of all methods you query with GetInstructions or
+		// you tricks around with fake generators (not recommended)
+		//
+		public static List<ILInstruction> GetInstructions(ILGenerator generator, MethodBase method)
 		{
-			if (method == null) throw new Exception("method cannot be null");
-			var reader = new MethodBodyReader(method, null);
+			if (method == null) throw new ArgumentNullException("Method cannot be null");
+			var reader = new MethodBodyReader(method, generator);
+			reader.DeclareVariables(null);
 			reader.ReadInstructions();
 			return reader.ilInstructions;
 		}
 
 		// constructor
-
+		//
 		public MethodBodyReader(MethodBase method, ILGenerator generator)
 		{
 			this.generator = generator;
@@ -67,22 +78,27 @@ namespace Harmony.ILCopying
 
 			var body = method.GetMethodBody();
 			if (body == null)
-				throw new ArgumentException("Method has no body");
+				throw new ArgumentException("Method " + method.FullDescription() + " has no body");
 
 			var bytes = body.GetILAsByteArray();
 			if (bytes == null)
-				throw new ArgumentException("Can not get the bytes of the method");
+				throw new ArgumentException("Can not get IL bytes of method " + method.FullDescription());
 			ilBytes = new ByteBuffer(bytes);
 			ilInstructions = new List<ILInstruction>((bytes.Length + 1) / 2);
 
-			Type type = method.DeclaringType;
-			if (type != null)
+			var type = method.DeclaringType;
+
+			if (type.IsGenericType)
 			{
-				if (type.IsGenericType || type.IsGenericTypeDefinition)
-					typeArguments = type.GetGenericArguments();
+				try { typeArguments = type.GetGenericArguments(); }
+				catch { typeArguments = null; }
 			}
-			if (method.IsGenericMethod || method.IsGenericMethodDefinition)
-				methodArguments = method.GetGenericArguments();
+
+			if (method.IsGenericMethod)
+			{
+				try { methodArguments = method.GetGenericArguments(); }
+				catch { methodArguments = null; }
+			}
 
 			if (!method.IsStatic)
 				this_parameter = new ThisParameter(method);
@@ -93,45 +109,23 @@ namespace Harmony.ILCopying
 		}
 
 		// read and parse IL codes
-
+		//
 		public void ReadInstructions()
 		{
 			while (ilBytes.position < ilBytes.buffer.Length)
 			{
 				var loc = ilBytes.position; // get location first (ReadOpCode will advance it)
-				var instruction = new ILInstruction(ReadOpCode());
-				instruction.offset = loc;
+				var instruction = new ILInstruction(ReadOpCode()) { offset = loc };
 				ReadOperand(instruction);
 				ilInstructions.Add(instruction);
 			}
 
 			ResolveBranches();
-		}
-
-		void ResolveBranches()
-		{
-			foreach (var instruction in ilInstructions)
-			{
-				switch (instruction.opcode.OperandType)
-				{
-					case OperandType.ShortInlineBrTarget:
-					case OperandType.InlineBrTarget:
-						instruction.operand = GetInstruction((int)instruction.operand);
-						break;
-
-					case OperandType.InlineSwitch:
-						var offsets = (int[])instruction.operand;
-						var branches = new ILInstruction[offsets.Length];
-						for (int j = 0; j < offsets.Length; j++)
-							branches[j] = GetInstruction(offsets[j]);
-
-						instruction.operand = branches;
-						break;
-				}
-			}
+			ParseExceptions();
 		}
 
 		// declare local variables
+		//
 		public void DeclareVariables(LocalBuilder[] existingVariables)
 		{
 			if (generator == null) return;
@@ -143,14 +137,116 @@ namespace Harmony.ILCopying
 				).ToArray();
 		}
 
-		// use parsed IL codes and emit them to a generator
+		// process all jumps
+		//
+		void ResolveBranches()
+		{
+			foreach (var ilInstruction in ilInstructions)
+			{
+				switch (ilInstruction.opcode.OperandType)
+				{
+					case OperandType.ShortInlineBrTarget:
+					case OperandType.InlineBrTarget:
+						ilInstruction.operand = GetInstruction((int)ilInstruction.operand, false);
+						break;
 
-		public void FinalizeILCodes(List<MethodInfo> transpilers, Label endLabel)
+					case OperandType.InlineSwitch:
+						var offsets = (int[])ilInstruction.operand;
+						var branches = new ILInstruction[offsets.Length];
+						for (var j = 0; j < offsets.Length; j++)
+							branches[j] = GetInstruction(offsets[j], false);
+
+						ilInstruction.operand = branches;
+						break;
+				}
+			}
+		}
+
+		// process all exception blocks
+		//
+		void ParseExceptions()
+		{
+			foreach (var exception in exceptions)
+			{
+				var try_start = exception.TryOffset;
+				var try_end = exception.TryOffset + exception.TryLength - 1;
+
+				var handler_start = exception.HandlerOffset;
+				var handler_end = exception.HandlerOffset + exception.HandlerLength - 1;
+
+				var clauseName = exception.Flags == ExceptionHandlingClauseOptions.Clause ? "catch" : exception.Flags.ToString().ToLower();
+
+				//FileLog.Log("METHOD " + method.DeclaringType.Name + "." + method.Name + "()");
+				//FileLog.Log("- EXCEPTION BLOCK:");
+				//FileLog.Log("  - try: " + string.Format("{0} + {1} = L_{0:x4} - L_{1:x4}", exception.TryOffset, exception.TryLength, try_start, try_end));
+				//FileLog.Log("  - " + clauseName + ": " + string.Format("{0} + {1} = L_{0:x4} - L_{1:x4}", exception.HandlerOffset, exception.HandlerLength, handler_start, handler_end));
+				//if (exception.Flags == ExceptionHandlingClauseOptions.Filter)
+				//	FileLog.Log("    Filter Offset: " + exception.FilterOffset);
+				//if (exception.Flags != ExceptionHandlingClauseOptions.Filter && exception.Flags != ExceptionHandlingClauseOptions.Finally)
+				//	FileLog.Log("    Exception Type: " + exception.CatchType);
+
+				var instr1 = GetInstruction(try_start, false);
+				instr1.blocks.Add(new ExceptionBlock(ExceptionBlockType.BeginExceptionBlock, null));
+
+				var instr2 = GetInstruction(handler_end, true);
+				instr2.blocks.Add(new ExceptionBlock(ExceptionBlockType.EndExceptionBlock, null));
+
+				// The FilterOffset property is meaningful only for Filter clauses. 
+				// The CatchType property is not meaningful for Filter or Finally clauses. 
+				//
+				switch (exception.Flags)
+				{
+					case ExceptionHandlingClauseOptions.Filter:
+						var instr3 = GetInstruction(exception.FilterOffset, false);
+						instr3.blocks.Add(new ExceptionBlock(ExceptionBlockType.BeginExceptFilterBlock, null));
+						break;
+
+					case ExceptionHandlingClauseOptions.Finally:
+						var instr4 = GetInstruction(handler_start, false);
+						instr4.blocks.Add(new ExceptionBlock(ExceptionBlockType.BeginFinallyBlock, null));
+						break;
+
+					case ExceptionHandlingClauseOptions.Clause:
+						var instr5 = GetInstruction(handler_start, false);
+						instr5.blocks.Add(new ExceptionBlock(ExceptionBlockType.BeginCatchBlock, exception.CatchType));
+						break;
+
+					case ExceptionHandlingClauseOptions.Fault:
+						var instr6 = GetInstruction(handler_start, false);
+						instr6.blocks.Add(new ExceptionBlock(ExceptionBlockType.BeginFaultBlock, null));
+						break;
+				}
+			}
+		}
+
+		// used in FinalizeILCodes to convert short jumps to long ones
+		static Dictionary<OpCode, OpCode> shortJumps = new Dictionary<OpCode, OpCode>()
+		{
+			{ OpCodes.Leave_S, OpCodes.Leave },
+			{ OpCodes.Brfalse_S, OpCodes.Brfalse },
+			{ OpCodes.Brtrue_S, OpCodes.Brtrue },
+			{ OpCodes.Beq_S, OpCodes.Beq },
+			{ OpCodes.Bge_S, OpCodes.Bge },
+			{ OpCodes.Bgt_S, OpCodes.Bgt },
+			{ OpCodes.Ble_S, OpCodes.Ble },
+			{ OpCodes.Blt_S, OpCodes.Blt },
+			{ OpCodes.Bne_Un_S, OpCodes.Bne_Un },
+			{ OpCodes.Bge_Un_S, OpCodes.Bge_Un },
+			{ OpCodes.Bgt_Un_S, OpCodes.Bgt_Un },
+			{ OpCodes.Ble_Un_S, OpCodes.Ble_Un },
+			{ OpCodes.Br_S, OpCodes.Br },
+			{ OpCodes.Blt_Un_S, OpCodes.Blt_Un }
+		};
+
+		// use parsed IL codes and emit them to a generator
+		//
+		public void FinalizeILCodes(List<MethodInfo> transpilers, List<Label> endLabels, List<ExceptionBlock> endBlocks)
 		{
 			if (generator == null) return;
 
 			// pass1 - define labels and add them to instructions that are target of a jump
-			ilInstructions.ForEach(ilInstruction =>
+			//
+			foreach (var ilInstruction in ilInstructions)
 			{
 				switch (ilInstruction.opcode.OperandType)
 				{
@@ -184,67 +280,118 @@ namespace Harmony.ILCopying
 							break;
 						}
 				}
-			});
+			}
 
 			// pass2 - filter through all processors
+			//
 			var codeTranspiler = new CodeTranspiler(ilInstructions);
-			transpilers.ForEach(transpiler => codeTranspiler.Add(transpiler));
-			var codeInstructions = codeTranspiler.GetResult(generator, method)
-				.Select(instruction =>
-				{
-					// TODO - improve the logic here. for now, we replace all short jumps
-					//        with long jumps regardless of how far the jump is
-					//
-					new Dictionary<OpCode, OpCode>
-					{
-						{ OpCodes.Beq_S, OpCodes.Beq },
-						{ OpCodes.Bge_S, OpCodes.Bge },
-						{ OpCodes.Bge_Un_S, OpCodes.Bge_Un },
-						{ OpCodes.Bgt_S, OpCodes.Bgt },
-						{ OpCodes.Bgt_Un_S, OpCodes.Bgt_Un },
-						{ OpCodes.Ble_S, OpCodes.Ble },
-						{ OpCodes.Ble_Un_S, OpCodes.Ble_Un },
-						{ OpCodes.Blt_S, OpCodes.Blt },
-						{ OpCodes.Blt_Un_S, OpCodes.Blt_Un },
-						{ OpCodes.Bne_Un_S, OpCodes.Bne_Un },
-						{ OpCodes.Brfalse_S, OpCodes.Brfalse },
-						{ OpCodes.Brtrue_S, OpCodes.Brtrue },
-						{ OpCodes.Br_S, OpCodes.Br }
-					}.Do(pair =>
-					{
-						if (instruction.opcode == pair.Key)
-							instruction.opcode = pair.Value;
-					});
+			transpilers.Do(transpiler => codeTranspiler.Add(transpiler));
+			var codeInstructions = codeTranspiler.GetResult(generator, method);
 
-					if (instruction.opcode == OpCodes.Ret)
-					{
-						instruction.opcode = OpCodes.Br;
-						instruction.operand = endLabel;
-					}
-					return instruction;
-				});
+			// pass3 - remove RET if it appears at the end
+			while (true)
+			{
+				var lastInstruction = codeInstructions.LastOrDefault();
+				if (lastInstruction == null || lastInstruction.opcode != OpCodes.Ret) break;
 
-			// pass3 - mark labels and emit codes
+				// remember any existing labels
+				endLabels.AddRange(lastInstruction.labels);
+
+				codeInstructions.RemoveAt(codeInstructions.Count - 1);
+			}
+
+			// pass4 - mark labels and exceptions and emit codes
+			//
+			var idx = 0;
 			codeInstructions.Do(codeInstruction =>
 			{
-				codeInstruction.labels.ForEach(label => Emitter.MarkLabel(generator, label));
+				// mark all labels
+				codeInstruction.labels.Do(label => Emitter.MarkLabel(generator, label));
+
+				// start all exception blocks
+				// TODO: we ignore the resulting label because we have no way to use it
+				//
+				codeInstruction.blocks.Do(block => { Label? label; Emitter.MarkBlockBefore(generator, block, out label); });
 
 				var code = codeInstruction.opcode;
 				var operand = codeInstruction.operand;
 
-				if (code.OperandType == OperandType.InlineNone)
-					Emitter.Emit(generator, code);
-				else
+				// replace RET with a jump to the end (outside this code)
+				if (code == OpCodes.Ret)
 				{
-					if (operand == null) throw new Exception("Wrong null argument: " + codeInstruction);
-					var emitMethod = EmitMethodForType(operand.GetType());
-					if (emitMethod == null) throw new Exception("Unknown Emit argument type " + operand.GetType() + " in " + codeInstruction);
-					if (HarmonyInstance.DEBUG) FileLog.Log(Emitter.CodePos(generator) + code + " " + Emitter.FormatArgument(operand));
-					emitMethod.Invoke(generator, new object[] { code, operand });
+					var endLabel = generator.DefineLabel();
+					code = OpCodes.Br;
+					operand = endLabel;
+					endLabels.Add(endLabel);
 				}
+
+				// replace short jumps with long ones (can be optimized but requires byte counting, not instruction counting)
+				if (shortJumps.TryGetValue(code, out var longJump))
+					code = longJump;
+
+				var emitCode = true;
+
+				//if (code == OpCodes.Leave || code == OpCodes.Leave_S)
+				//{
+				//	// skip LEAVE on EndExceptionBlock
+				//	if (codeInstruction.blocks.Any(block => block.blockType == ExceptionBlockType.EndExceptionBlock))
+				//		emitCode = false;
+
+				//	// skip LEAVE on next instruction starts a new exception handler and we are already in 
+				//	if (idx < instructions.Length - 1)
+				//		if (instructions[idx + 1].blocks.Any(block => block.blockType != ExceptionBlockType.EndExceptionBlock))
+				//			emitCode = false;
+				//}
+
+				if (emitCode)
+				{
+					switch (code.OperandType)
+					{
+						case OperandType.InlineNone:
+							Emitter.Emit(generator, code);
+							break;
+
+						case OperandType.InlineSig:
+
+							// TODO the following will fail because we do not convert the token (operand)
+							// All the decompilers can show the arguments correctly, we just need to find out how
+							//
+							if (operand == null) throw new Exception("Wrong null argument: " + codeInstruction);
+							if ((operand is int) == false) throw new Exception("Wrong Emit argument type " + operand.GetType() + " in " + codeInstruction);
+							Emitter.Emit(generator, code, (int)operand);
+
+							/*
+							// the following will only work if we can convert the original signature token to the required arguments
+							//
+							var callingConvention = System.Runtime.InteropServices.CallingConvention.ThisCall;
+							var returnType = typeof(object);
+							var parameterTypes = new[] { typeof(object) };
+							Emitter.EmitCalli(generator, code, callingConvention, returnType, parameterTypes);
+
+							var callingConventions = System.Reflection.CallingConventions.Standard;
+							var optionalParameterTypes = new[] { typeof(object) };
+							Emitter.EmitCalli(generator, code, callingConventions, returnType, parameterTypes, optionalParameterTypes);
+							*/
+							break;
+
+						default:
+							if (operand == null) throw new Exception("Wrong null argument: " + codeInstruction);
+							var emitMethod = EmitMethodForType(operand.GetType());
+							if (emitMethod == null) throw new Exception("Unknown Emit argument type " + operand.GetType() + " in " + codeInstruction);
+							if (HarmonyInstance.DEBUG) FileLog.LogBuffered(Emitter.CodePos(generator) + code + " " + Emitter.FormatArgument(operand));
+							emitMethod.Invoke(generator, new object[] { code, operand });
+							break;
+					}
+				}
+
+				codeInstruction.blocks.Do(block => Emitter.MarkBlockAfter(generator, block));
+
+				idx++;
 			});
 		}
 
+		// interpret member info value
+		//
 		static void GetMemberInfoValue(MemberInfo info, out object result)
 		{
 			result = null;
@@ -278,7 +425,7 @@ namespace Harmony.ILCopying
 		}
 
 		// interpret instruction operand
-
+		//
 		void ReadOperand(ILInstruction instruction)
 		{
 			switch (instruction.opcode.OperandType)
@@ -294,7 +441,7 @@ namespace Harmony.ILCopying
 						var length = ilBytes.ReadInt32();
 						var base_offset = ilBytes.position + (4 * length);
 						var branches = new int[length];
-						for (int i = 0; i < length; i++)
+						for (var i = 0; i < length; i++)
 							branches[i] = ilBytes.ReadInt32() + base_offset;
 						instruction.operand = branches;
 						break;
@@ -366,8 +513,12 @@ namespace Harmony.ILCopying
 				case OperandType.InlineSig:
 					{
 						var val = ilBytes.ReadInt32();
-						instruction.operand = module.ResolveSignature(val);
-						instruction.argument = (SignatureHelper)instruction.operand;
+						var bytes = module.ResolveSignature(val);
+						instruction.operand = bytes;
+						instruction.argument = bytes;
+						Debugger.Log(0, "TEST", "METHOD " + method.FullDescription() + "\n");
+						Debugger.Log(0, "TEST", "Signature = " + bytes.Select(b => string.Format("0x{0:x02}", b)).Aggregate((a, b) => a + " " + b) + "\n");
+						Debugger.Break();
 						break;
 					}
 
@@ -463,59 +614,37 @@ namespace Harmony.ILCopying
 			}
 		}
 
-		// TODO - implement
-		void ParseExceptions()
-		{
-			foreach (var ehc in exceptions)
-			{
-				//Log.Error("ExceptionHandlingClause, flags " + ehc.Flags.ToString());
-
-				// The FilterOffset property is meaningful only for Filter
-				// clauses. The CatchType property is not meaningful for 
-				// Filter or Finally clauses. 
-				switch (ehc.Flags)
-				{
-					case ExceptionHandlingClauseOptions.Filter:
-						//Log.Error("    Filter Offset: " + ehc.FilterOffset);
-						break;
-					case ExceptionHandlingClauseOptions.Finally:
-						break;
-						//default:
-						//Log.Error("Type of exception: " + ehc.CatchType);
-						//break;
-				}
-
-				//Log.Error("   Handler Length: " + ehc.HandlerLength);
-				//Log.Error("   Handler Offset: " + ehc.HandlerOffset);
-				//Log.Error(" Try Block Length: " + ehc.TryLength);
-				//Log.Error(" Try Block Offset: " + ehc.TryOffset);
-			}
-		}
-
-		ILInstruction GetInstruction(int offset)
+		ILInstruction GetInstruction(int offset, bool isEndOfInstruction)
 		{
 			var lastInstructionIndex = ilInstructions.Count - 1;
 			if (offset < 0 || offset > ilInstructions[lastInstructionIndex].offset)
 				throw new Exception("Instruction offset " + offset + " is outside valid range 0 - " + ilInstructions[lastInstructionIndex].offset);
 
-			int min = 0;
-			int max = lastInstructionIndex;
+			var min = 0;
+			var max = lastInstructionIndex;
 			while (min <= max)
 			{
-				int mid = min + ((max - min) / 2);
+				var mid = min + ((max - min) / 2);
 				var instruction = ilInstructions[mid];
-				var instruction_offset = instruction.offset;
 
-				if (offset == instruction_offset)
-					return instruction;
+				if (isEndOfInstruction)
+				{
+					if (offset == instruction.offset + instruction.GetSize() - 1)
+						return instruction;
+				}
+				else
+				{
+					if (offset == instruction.offset)
+						return instruction;
+				}
 
-				if (offset < instruction_offset)
+				if (offset < instruction.offset)
 					max = mid - 1;
 				else
 					min = mid + 1;
 			}
 
-			throw new Exception("Cannot find instruction for " + offset);
+			throw new Exception("Cannot find instruction for " + offset.ToString("X4"));
 		}
 
 		static bool TargetsLocalVariable(OpCode opcode)
@@ -525,7 +654,7 @@ namespace Harmony.ILCopying
 
 		LocalVariableInfo GetLocalVariable(int index)
 		{
-			return locals == null ? null : locals[index];
+			return locals?[index];
 		}
 
 		ParameterInfo GetParameter(int index)
@@ -546,9 +675,9 @@ namespace Harmony.ILCopying
 
 		MethodInfo EmitMethodForType(Type type)
 		{
-			foreach (KeyValuePair<Type, MethodInfo> entry in emitMethods)
+			foreach (var entry in emitMethods)
 				if (entry.Key == type) return entry.Value;
-			foreach (KeyValuePair<Type, MethodInfo> entry in emitMethods)
+			foreach (var entry in emitMethods)
 				if (entry.Key.IsAssignableFrom(type)) return entry.Value;
 			return null;
 		}
@@ -583,7 +712,7 @@ namespace Harmony.ILCopying
 
 			emitMethods = new Dictionary<Type, MethodInfo>();
 			typeof(ILGenerator).GetMethods().ToList()
-				.ForEach(method =>
+				.Do(method =>
 				{
 					if (method.Name != "Emit") return;
 					var pinfos = method.GetParameters();

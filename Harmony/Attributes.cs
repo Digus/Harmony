@@ -1,4 +1,5 @@
-﻿using System;
+using System;
+using System.Reflection;
 
 namespace Harmony
 {
@@ -6,6 +7,14 @@ namespace Harmony
 	{
 		Getter,
 		Setter
+	}
+
+	public enum HarmonyPatchType
+	{
+		All,
+		Prefix,
+		Postfix,
+		Transpiler
 	}
 
 	public class HarmonyAttribute : Attribute
@@ -55,6 +64,14 @@ namespace Harmony
 		}
 	}
 
+	[AttributeUsage(AttributeTargets.Class)]
+	public class HarmonyPatchAll : HarmonyAttribute
+	{
+		public HarmonyPatchAll()
+		{
+		}
+	}
+
 	[AttributeUsage(AttributeTargets.Class | AttributeTargets.Method)]
 	public class HarmonyPriority : HarmonyAttribute
 	{
@@ -91,7 +108,17 @@ namespace Harmony
 	}
 
 	[AttributeUsage(AttributeTargets.Method)]
+	public class HarmonyCleanup : Attribute
+	{
+	}
+
+	[AttributeUsage(AttributeTargets.Method)]
 	public class HarmonyTargetMethod : Attribute
+	{
+	}
+
+	[AttributeUsage(AttributeTargets.Method)]
+	public class HarmonyTargetMethods : Attribute
 	{
 	}
 
@@ -110,9 +137,6 @@ namespace Harmony
 	{
 	}
 
-	// If you want to rename parameter name in case it's obfuscated or something else 
-	// you can use the following attribute:
-
 	[AttributeUsage(AttributeTargets.Parameter | AttributeTargets.Method | AttributeTargets.Class, AllowMultiple = true)]
 	public class HarmonyParameter : Attribute
 	{
@@ -127,6 +151,19 @@ namespace Harmony
 		{
 			OriginalName = originalName;
 			NewName = newName;
+		}
+	}
+
+	// This attribute is for Harmony patching itself to the latest
+	//
+	[AttributeUsage(AttributeTargets.Method)]
+	internal class UpgradeToLatestVersion : Attribute
+	{
+		public int version;
+
+		public UpgradeToLatestVersion(int version)
+		{
+			this.version = version;
 		}
 	}
 }

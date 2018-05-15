@@ -1,4 +1,4 @@
-﻿using Harmony.ILCopying;
+using Harmony.ILCopying;
 using System;
 using System.Linq;
 using System.Reflection;
@@ -9,9 +9,87 @@ namespace Harmony
 {
 	public static class DynamicTools
 	{
+		/* TODO add support for functions that return structs larger than 8 bytes
+		 *
+		 * https://github.com/dotnet/coreclr/issues/12503
+		 * https://stackoverflow.com/questions/44641195/what-could-cause-p-invoke-arguments-to-be-out-of-order-when-passed
+		 *
+		 * ERROR
+		 * Managed Debugging Assistant 'FatalExecutionEngineError' 
+		 * The runtime has encountered a fatal error. The address of the error was at 0x72747d0e, on thread 0x9c38. The error code is 0xc0000005. This error may be a bug in the CLR or in the unsafe or non-verifiable portions of user code. Common sources of this bug include user marshaling errors for COM-interop or PInvoke, which may corrupt the stack.
+		 *
+		 * Calling signatures change:
+		 * .NET <4.5 jits to void Func(ref LargeReturnStruct, object this, params)
+		 * .NET 4.5+ jits to Func(object this, ref LargeReturnStruct, params)
+		 * 
+		 * // Test case
+
+			[StructLayout(LayoutKind.Sequential, Pack = 8)]
+			public struct Struct1
+			{
+				 public double foo;
+				 public double bar;
+			}
+
+			public class StructTest1
+			{
+				public Struct1 PatchMe()
+				{
+					return default(Struct1);
+				}
+			}
+		 * 
+		 */
 		public static DynamicMethod CreateDynamicMethod(MethodBase original, string suffix)
 		{
-			if (original == null) throw new Exception("original cannot be null");
+			if (original == null) throw new ArgumentNullException("original cannot be null");
+			var patchName = original.Name + suffix;
+			patchName = patchName.Replace("<>", "");
+
+			var parameters = original.GetParameters();
+			var result = parameters.Types().ToList();
+			if (original.IsStatic == false)
+				result.Insert(0, typeof(object));
+			var paramTypes = result.ToArray();
+			var returnType = AccessTools.GetReturnedType(original);
+
+			// DynamicMethod does not support byref return types
+			if (returnType == null || returnType.IsByRef)
+				return null;
+
+			DynamicMethod method;
+			try
+			{
+				method = new DynamicMethod(
+				patchName,
+				MethodAttributes.Public | MethodAttributes.Static,
+				CallingConventions.Standard,
+				returnType,
+				paramTypes,
+				original.DeclaringType,
+				true
+			);
+			}
+			catch (Exception)
+			{
+				return null;
+			}
+
+			for (var i = 0; i < parameters.Length; i++)
+				method.DefineParameter(i + 1, parameters[i].Attributes, parameters[i].Name);
+
+			return method;
+		}
+
+		public static ILGenerator CreateSaveableMethod(MethodBase original, string suffix, out AssemblyBuilder assemblyBuilder, out TypeBuilder typeBuilder)
+		{
+			var assemblyName = new AssemblyName("DebugAssembly");
+			var path = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
+			assemblyBuilder = AppDomain.CurrentDomain.DefineDynamicAssembly(assemblyName, AssemblyBuilderAccess.RunAndSave, path);
+			var moduleBuilder = assemblyBuilder.DefineDynamicModule(assemblyName.Name, assemblyName.Name + ".dll");
+			typeBuilder = moduleBuilder.DefineType("Debug" + original.DeclaringType.Name, TypeAttributes.Public);
+
+			if (original == null) throw new ArgumentNullException("original cannot be null");
 			var patchName = original.Name + suffix;
 			patchName = patchName.Replace("<>", "");
 
@@ -21,28 +99,33 @@ namespace Harmony
 				result.Insert(0, typeof(object));
 			var paramTypes = result.ToArray();
 
-			var method = new DynamicMethod(
+			var methodBuilder = typeBuilder.DefineMethod(
 				patchName,
 				MethodAttributes.Public | MethodAttributes.Static,
 				CallingConventions.Standard,
 				AccessTools.GetReturnedType(original),
-				paramTypes,
-				original.DeclaringType,
-				true
+				paramTypes
 			);
 
-			for (int i = 0; i < parameters.Length; i++)
-				method.DefineParameter(i + 1, parameters[i].Attributes, parameters[i].Name);
-
-			return method;
+			return methodBuilder.GetILGenerator();
 		}
 
-		public static LocalBuilder[] DeclareLocalVariables(MethodBase original, ILGenerator il)
+		public static void SaveMethod(AssemblyBuilder assemblyBuilder, TypeBuilder typeBuilder)
 		{
-			return original.GetMethodBody().LocalVariables.Select(lvi =>
+			var t = typeBuilder.CreateType();
+			assemblyBuilder.Save("HarmonyDebugAssembly.dll");
+		}
+
+		public static LocalBuilder[] DeclareLocalVariables(MethodBase original, ILGenerator il, bool logOutput = true)
+		{
+			var vars = original.GetMethodBody()?.LocalVariables;
+			if (vars == null)
+				return new LocalBuilder[0];
+			return vars.Select(lvi =>
 			{
 				var localBuilder = il.DeclareLocal(lvi.LocalType, lvi.IsPinned);
-				Emitter.LogLastLocalVariable(il);
+				if (logOutput)
+					Emitter.LogLocalVariable(il, localBuilder);
 				return localBuilder;
 			}).ToArray();
 		}
@@ -51,26 +134,26 @@ namespace Harmony
 		{
 			if (type.IsByRef) type = type.GetElementType();
 
-			if (AccessTools.isClass(type))
+			if (AccessTools.IsClass(type))
 			{
 				var v = il.DeclareLocal(type);
-				Emitter.LogLastLocalVariable(il);
+				Emitter.LogLocalVariable(il, v);
 				Emitter.Emit(il, OpCodes.Ldnull);
 				Emitter.Emit(il, OpCodes.Stloc, v);
 				return v;
 			}
-			if (AccessTools.isStruct(type))
+			if (AccessTools.IsStruct(type))
 			{
 				var v = il.DeclareLocal(type);
-				Emitter.LogLastLocalVariable(il);
+				Emitter.LogLocalVariable(il, v);
 				Emitter.Emit(il, OpCodes.Ldloca, v);
 				Emitter.Emit(il, OpCodes.Initobj, type);
 				return v;
 			}
-			if (AccessTools.isValue(type))
+			if (AccessTools.IsValue(type))
 			{
 				var v = il.DeclareLocal(type);
-				Emitter.LogLastLocalVariable(il);
+				Emitter.LogLocalVariable(il, v);
 				if (type == typeof(float))
 					Emitter.Emit(il, OpCodes.Ldc_R4, (float)0);
 				else if (type == typeof(double))
@@ -112,8 +195,15 @@ namespace Harmony
 			if (m_GetMethodInfo != null)
 			{
 				var runtimeMethodInfo = m_GetMethodInfo.Invoke(handle, new object[0]);
-				m__CompileMethod.Invoke(null, new object[] { runtimeMethodInfo });
-				return;
+				try
+				{
+					// this can throw BadImageFormatException "An attempt was made to load a program with an incorrect format"
+					m__CompileMethod.Invoke(null, new object[] { runtimeMethodInfo });
+					return;
+				}
+				catch (Exception)
+				{
+				}
 			}
 
 			// 2) RuntimeHelpers._CompileMethod(handle.Value)
