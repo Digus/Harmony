@@ -1,19 +1,19 @@
-﻿using System;
+using System;
 using System.Text;
 using System.Collections.Generic;
 using System.Linq;
-using Microsoft.VisualStudio.TestTools.UnitTesting;
-using HarmonyTests.Assets;
-using Harmony;
+using NUnit.Framework;
+using HarmonyLibTests.Assets;
+using HarmonyLib;
 
-namespace HarmonyTests
+namespace HarmonyLibTests
 {
-	[TestClass]
+	[TestFixture]
 	public class TestTraverse_Types
 	{
-		private class InnerClass { }
+		class InnerClass { }
 
-		[TestMethod]
+		[Test]
 		public void Traverse_Types()
 		{
 			var instance = new Assets.TraverseTypes<InnerClass>();
@@ -36,15 +36,14 @@ namespace HarmonyTests
 			var mixed = trv.Field("MixedField").GetValue<Dictionary<InnerClass, List<string>>>();
 			var key = trv.Field("key").GetValue<InnerClass>();
 
-			List<string> value;
-			mixed.TryGetValue(key, out value);
+			_ = mixed.TryGetValue(key, out var value);
 			Assert.AreEqual("world", value.First());
 
 			var trvEmpty = Traverse.Create(instance).Type("FooBar");
 			TestTraverse_Basics.AssertIsEmpty(trvEmpty);
 		}
 
-		[TestMethod]
+		[Test]
 		public void Traverse_InnerInstance()
 		{
 			var instance = new TraverseNestedTypes(null);
@@ -54,11 +53,11 @@ namespace HarmonyTests
 			field1.SetValue("somevalue");
 
 			var trv2 = Traverse.Create(instance);
-			var field2 = trv1.Field("innerInstance").Field("inner2").Field("field");
+			var field2 = trv2.Field("innerInstance").Field("inner2").Field("field");
 			Assert.AreEqual("somevalue", field2.GetValue());
 		}
 
-		[TestMethod]
+		[Test]
 		public void Traverse_InnerStatic()
 		{
 			var trv1 = Traverse.Create(typeof(TraverseNestedTypes));
@@ -66,7 +65,7 @@ namespace HarmonyTests
 			field1.SetValue("somevalue1");
 
 			var trv2 = Traverse.Create(typeof(TraverseNestedTypes));
-			var field2 = trv1.Field("innerStatic").Field("inner2").Field("field");
+			var field2 = trv2.Field("innerStatic").Field("inner2").Field("field");
 			Assert.AreEqual("somevalue1", field2.GetValue());
 
 			var _ = new TraverseNestedTypes("somevalue2");
